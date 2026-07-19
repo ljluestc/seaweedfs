@@ -232,16 +232,24 @@ func (vl *VolumeLayout) rememberOversizedVolume(v *storage.VolumeInfo, dn *DataN
 // pending writes), so we reset effectiveSize to the reported size instead of
 // decaying.
 //
-// Returns recoveredToWritable = true when decay brought a volume that was
-// previously eagerly removed by RecordAssign back under the writable
-// threshold and this call re-added it to the writable list. The caller
-// should mirror the activeVolumeCount bookkeeping.
+// Returns recoveredToWritable = true when the volume was re-added to the
+// writable list and the caller must mirror the activeVolumeCount bookkeeping
+// (i.e. the volume was previously removed with a corresponding decrement).
+// This happens in two cases:
+//  1. Compaction detected (compactRevision changed) AND the volume was previously
+//     capacity-full (fullSince set): immediate re-add, activeVolumeCount restored.
+//  2. Decay brought effectiveSize below the crowded threshold after the
+//     capacityRecoveryDelay: re-add and restore activeVolumeCount.
+//
+// Compaction-only recovery (fullSince was zero, e.g. removed only by vacuum)
+// re-adds the volume but returns false — no activeVolumeCount change needed.
 func (vl *VolumeLayout) UpdateVolumeSize(vid needle.VolumeId, reportedSize uint64, compactRevision uint32) (recoveredToWritable bool) {
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
 
 	now := time.Now()
 	st := vl.sizeTracking[vid]
+	var wasCompacted bool
 	if st == nil {
 		st = &volumeSizeTracking{
 			effectiveSize:   reportedSize,
@@ -257,6 +265,7 @@ func (vl *VolumeLayout) UpdateVolumeSize(vid needle.VolumeId, reportedSize uint6
 		st.reportedSize = reportedSize
 		if compactRevision != st.compactRevision {
 			// Compaction happened — size drop is real, not pending. Reset.
+			wasCompacted = true
 			st.compactRevision = compactRevision
 			st.effectiveSize = reportedSize
 		} else if st.effectiveSize > reportedSize {
@@ -272,6 +281,28 @@ func (vl *VolumeLayout) UpdateVolumeSize(vid needle.VolumeId, reportedSize uint6
 		return false
 	}
 	vl.removeFromCrowded(vid)
+
+	// Compaction-driven recovery: the data node reported a new compact_revision,
+	// confirming a genuine size reduction (vacuum commit or TTL-expiry compaction).
+	// Re-add the volume to the writable list immediately — no capacityRecoveryDelay
+	// — so volumes that were removed by DrainAndRemoveFromWritable but never returned
+	// via SetVolumeAvailable (e.g. vacuum commit failure, master restart mid-vacuum,
+	// or autonomous TTL-expiry compaction) are correctly recovered. Fixes issue #3265
+	// where empty volumes (size=8) were permanently excluded from the writable pool.
+	if wasCompacted && reportedSize < vl.volumeSizeLimit && !vl.oversizedVolumes.IsTrue(vid) &&
+		vl.enoughCopies(vid) && vl.isAllWritable(vid) {
+		if vl.setVolumeWritable(vid) {
+			glog.V(0).Infof("Volume %d recovered to writable after compaction (effective=%d, reported=%d, limit=%d).",
+				vid, st.effectiveSize, reportedSize, vl.volumeSizeLimit)
+			if !st.fullSince.IsZero() {
+				// Volume was capacity-full before compaction; the corresponding
+				// activeVolumeCount decrement needs to be undone.
+				st.fullSince = time.Time{}
+				return true
+			}
+		}
+		return false
+	}
 
 	// Recovery path: if we eagerly removed this volume from writables in
 	// RecordAssign, decay may now have brought effectiveSize back under
