@@ -34,7 +34,8 @@ func (ms *MasterServer) RaftListClusterServers(ctx context.Context, req *master_
 		}
 	} else if ms.Topo.RaftServer != nil {
 		peers := ms.Topo.RaftServer.Peers()
-		leader := ms.Topo.RaftServer.Leader()
+		// Use the atomic cache to avoid racing with the raft library's setState().
+		leader := string(ms.Topo.GetCachedLeader())
 		currentServerName := ms.Topo.RaftServer.Name()
 		ms.Topo.RaftServerAccessLock.RUnlock()
 

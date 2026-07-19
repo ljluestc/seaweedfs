@@ -283,7 +283,12 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 			time.Sleep(delay)
 
 			ms.Topo.RaftServerAccessLock.RLock()
-			isEmptyMaster := ms.Topo.RaftServer.Leader() == "" && ms.Topo.RaftServer.IsLogEmpty()
+			logEmpty := ms.Topo.RaftServer.IsLogEmpty()
+			ms.Topo.RaftServerAccessLock.RUnlock()
+			// Use the atomic cache instead of RaftServer.Leader() which races
+			// with the raft library's setState() goroutine (issue #3509).
+			cachedLeader := ms.Topo.GetCachedLeader()
+			isEmptyMaster := cachedLeader == "" && logEmpty
 			isFirst := idx == 0
 			if isEmptyMaster && isFirst {
 				existingLeader := ms.MasterClient.FindLeaderFromOtherPeers(myMasterAddress)
@@ -293,11 +298,10 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 					glog.V(0).Infof("skip bootstrap: existing leader %s found from peers", existingLeader)
 				}
 			} else if !isEmptyMaster {
-				glog.V(0).Infof("skip bootstrap: leader=%q logEmpty=%v", ms.Topo.RaftServer.Leader(), ms.Topo.RaftServer.IsLogEmpty())
+				glog.V(0).Infof("skip bootstrap: leader=%q logEmpty=%v", cachedLeader, logEmpty)
 			} else {
 				glog.V(0).Infof("skip bootstrap: %v is not the first master in peers (index %d)", myMasterAddress, idx)
 			}
-			ms.Topo.RaftServerAccessLock.RUnlock()
 		}()
 	}
 

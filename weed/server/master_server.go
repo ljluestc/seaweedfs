@@ -242,12 +242,23 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 	if raftServer.raftServer != nil {
 		ms.Topo.RaftServer = raftServer.raftServer
 		ms.Topo.RaftServer.AddEventListener(raft.LeaderChangeEventType, func(e raft.Event) {
+			// Derive the new leader name from the event value to avoid calling
+			// RaftServer.Leader() from this callback: it may run asynchronously
+			// and would race with the raft library's own setState() goroutine.
+			newLeader := ""
+			if v, ok := e.Value().(string); ok {
+				newLeader = v
+			}
+			// Update the atomic cache so IsLeader/MaybeLeader never need to
+			// call RaftServer.Leader() from application goroutines.
+			ms.Topo.SetCachedLeader(pb.ServerAddress(newLeader))
+
 			glog.V(0).Infof("leader change event: %+v => %+v", e.PrevValue(), e.Value())
-			stats.MasterLeaderChangeCounter.WithLabelValues(fmt.Sprintf("%+v", e.Value())).Inc()
-			if ms.Topo.RaftServer.Leader() != "" {
-				glog.V(0).Infof("[%s] %s becomes leader.", ms.Topo.RaftServer.Name(), ms.Topo.RaftServer.Leader())
+			stats.MasterLeaderChangeCounter.WithLabelValues(newLeader).Inc()
+			if newLeader != "" {
+				glog.V(0).Infof("[%s] %s becomes leader.", ms.Topo.RaftServer.Name(), newLeader)
 				ms.Topo.SetLastLeaderChangeTime(time.Now())
-				if pb.ServerAddress(ms.Topo.RaftServer.Leader()).Equals(pb.ServerAddress(ms.Topo.RaftServer.Name())) {
+				if pb.ServerAddress(newLeader).Equals(pb.ServerAddress(ms.Topo.RaftServer.Name())) {
 					go ms.ensureTopologyId()
 				}
 			}
@@ -268,15 +279,14 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 		go ms.ensureTopologyId()
 	} else {
 		var raftServerLeader string
-		ms.Topo.RaftServerAccessLock.RLock()
 		if ms.Topo.RaftServer != nil {
-			raftServerLeader = ms.Topo.RaftServer.Leader()
+			// Use the atomic cache; RaftServer.Leader() would race with setState().
+			raftServerLeader = string(ms.Topo.GetCachedLeader())
 		} else if ms.Topo.HashicorpRaft != nil {
 			raftServerName = ms.Topo.HashicorpRaft.String()
 			raftServerLeaderAddr, _ := ms.Topo.HashicorpRaft.LeaderWithID()
 			raftServerLeader = string(raftServerLeaderAddr)
 		}
-		ms.Topo.RaftServerAccessLock.RUnlock()
 		glog.V(0).Infof("%s %s - is the leader.", raftServerName, raftServerLeader)
 	}
 }

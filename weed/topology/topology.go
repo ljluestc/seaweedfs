@@ -64,6 +64,15 @@ type Topology struct {
 	barrierLock          sync.Mutex
 	barrierDone          bool
 
+	// cachedLeader holds the most recently observed raft leader address. It is
+	// updated atomically by the LeaderChangeEventType event listener (called
+	// from within the raft server's own goroutine after setState completes).
+	// Application goroutines must read this cache instead of calling
+	// RaftServer.Leader() or RaftServer.State() directly: the raft library's
+	// internal mutex does not prevent concurrent reads in Leader()/State() from
+	// racing with setState() writes, causing the data race in issue #3509.
+	cachedLeader atomic.Value // stores string (pb.ServerAddress)
+
 	UuidAccessLock sync.RWMutex
 	UuidMap        map[string][]string
 
@@ -242,22 +251,36 @@ func (t *Topology) RemainingWarmupDuration() time.Duration {
 	return remaining
 }
 
+// SetCachedLeader stores the current raft leader address in the atomic cache.
+// It must be called from the LeaderChangeEventType event listener so it runs
+// in the raft server's own goroutine (after setState completes), never from
+// an application goroutine that could race with setState.
+func (t *Topology) SetCachedLeader(leader pb.ServerAddress) {
+	t.cachedLeader.Store(string(leader))
+}
+
+// GetCachedLeader returns the last observed raft leader address. Returns ""
+// before the first leader is elected. Application goroutines must use this
+// instead of calling RaftServer.Leader() directly (see cachedLeader field).
+func (t *Topology) GetCachedLeader() pb.ServerAddress {
+	if v := t.cachedLeader.Load(); v != nil {
+		return pb.ServerAddress(v.(string))
+	}
+	return ""
+}
+
 func (t *Topology) IsLeader() bool {
 	t.RaftServerAccessLock.RLock()
 	defer t.RaftServerAccessLock.RUnlock()
 
 	if t.RaftServer != nil {
-		if t.RaftServer.State() == raft.Leader {
-			return true
-		}
-		// Directly check leader to avoid re-acquiring lock via MaybeLeader()
-		leader := pb.ServerAddress(t.RaftServer.Leader())
-		if leader != "" {
-			if pb.ServerAddress(t.RaftServer.Name()).Equals(leader) {
-				return true
-			}
-		}
+		// Use the event-driven cache rather than calling RaftServer.Leader() or
+		// RaftServer.State() directly: those methods read internal raft state
+		// without holding the raft library's own mutex and race with setState().
+		leader := t.GetCachedLeader()
+		return leader != "" && pb.ServerAddress(t.RaftServer.Name()).Equals(leader)
 	} else if t.HashicorpRaft != nil {
+		// hashicorp/raft uses atomic operations internally; State() is race-free.
 		if t.HashicorpRaft.State() == hashicorpRaft.Leader {
 			return true
 		}
@@ -310,16 +333,11 @@ func (t *Topology) Leader() (l pb.ServerAddress, err error) {
 		func() (l pb.ServerAddress, err error) {
 			l, err = t.MaybeLeader()
 			if err == nil && l == "" {
-				// Thread-safe check if we are the leader
-				t.RaftServerAccessLock.RLock()
-				if t.RaftServer != nil && t.RaftServer.State() == raft.Leader {
-					l = pb.ServerAddress(t.RaftServer.Name())
-				}
-				t.RaftServerAccessLock.RUnlock()
-
-				if l != "" {
-					return l, nil
-				}
+				// MaybeLeader already consults the atomic cache for RaftServer
+				// and returns "" when no leader has been elected yet. The old
+				// RaftServer.State()==Leader fallback was racy and is no longer
+				// needed: SetCachedLeader updates the cache as soon as we win
+				// an election via the LeaderChangeEventType event.
 				err = leaderNotSelected
 			}
 			return l, err
@@ -336,7 +354,9 @@ func (t *Topology) MaybeLeader() (l pb.ServerAddress, err error) {
 	defer t.RaftServerAccessLock.RUnlock()
 
 	if t.RaftServer != nil {
-		l = pb.ServerAddress(t.RaftServer.Leader())
+		// Use the atomic cache instead of RaftServer.Leader() to avoid the
+		// data race between this goroutine and the raft library's setState().
+		l = t.GetCachedLeader()
 	} else if t.HashicorpRaft != nil {
 		l = pb.ServerAddress(t.HashicorpRaft.Leader())
 	} else {
