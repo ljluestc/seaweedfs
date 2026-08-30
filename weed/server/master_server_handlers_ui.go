@@ -23,9 +23,13 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 
 	if ms.Topo.RaftServer != nil {
 		args := struct {
-			Version           string
-			Topology          interface{}
-			RaftServer        raft.Server
+			Version    string
+			Topology   interface{}
+			RaftServer raft.Server
+			// RaftLeader comes from the topology cache: rendering
+			// .RaftServer.Leader would read the raft server state without a
+			// lock (issue #3509).
+			RaftLeader        string
 			Stats             map[string]interface{}
 			Counters          *stats.ServerStats
 			VolumeSizeLimitMB uint32
@@ -33,6 +37,7 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 			version.Version(),
 			ms.Topo.ToInfo(),
 			ms.Topo.RaftServer,
+			ms.Topo.GoRaftLeader(),
 			infos,
 			serverStats,
 			ms.option.VolumeSizeLimitMB,

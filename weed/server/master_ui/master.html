@@ -33,7 +33,7 @@
                 {{ with .RaftServer }}
                 <tr>
                     <th>Leader</th>
-                    <td><a href="{{ url .Leader }}">{{ .Leader }}</a></td>
+                    <td><a href="{{ url $.RaftLeader }}">{{ $.RaftLeader }}</a></td>
                 </tr>
                 <tr>
                     <th>Other Masters</th>

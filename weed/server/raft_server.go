@@ -187,6 +187,11 @@ func NewRaftServer(option *RaftServerOption) (*RaftServer, error) {
 		s.raftServer.SetElectionTimeout(time.Millisecond)
 	}
 
+	// Subscribe the topology leader cache before the raft loop starts, so no
+	// leader or state change event is missed and nothing has to read the raft
+	// server's unsynchronized leader field (issue #3509).
+	option.Topo.AttachGoRaftEventListeners(s.raftServer)
+
 	if err := s.raftServer.Start(); err != nil {
 		return nil, err
 	}
@@ -197,7 +202,7 @@ func NewRaftServer(option *RaftServerOption) (*RaftServer, error) {
 			ticker := time.NewTicker(100 * time.Millisecond)
 			defer ticker.Stop()
 			timeout := time.After(option.ElectionTimeout)
-			for s.raftServer.Leader() == "" {
+			for s.topo.GoRaftLeader() == "" {
 				select {
 				case <-timeout:
 					glog.Warningf("Fast resume timed out waiting for leader election, restoring election timeout to %v", option.ElectionTimeout)
@@ -229,7 +234,7 @@ func NewRaftServer(option *RaftServerOption) (*RaftServer, error) {
 
 	s.GrpcServer = raft.NewGrpcServer(s.raftServer)
 
-	glog.V(0).Infof("current cluster leader: %v", s.raftServer.Leader())
+	glog.V(0).Infof("current cluster leader: %v", s.topo.GoRaftLeader())
 
 	return s, nil
 }

@@ -60,9 +60,12 @@ type Topology struct {
 
 	RaftServer           raft.Server
 	RaftServerAccessLock sync.RWMutex
-	HashicorpRaft        *hashicorpRaft.Raft
-	barrierLock          sync.Mutex
-	barrierDone          bool
+	// goRaftLeader caches what the goraft event loop reports, so that leader
+	// lookups never read github.com/seaweedfs/raft's unsynchronized fields.
+	goRaftLeader  goRaftLeaderCache
+	HashicorpRaft *hashicorpRaft.Raft
+	barrierLock   sync.Mutex
+	barrierDone   bool
 
 	UuidAccessLock sync.RWMutex
 	UuidMap        map[string][]string
@@ -250,13 +253,9 @@ func (t *Topology) IsLeader() bool {
 		if t.RaftServer.State() == raft.Leader {
 			return true
 		}
-		// Directly check leader to avoid re-acquiring lock via MaybeLeader()
-		leader := pb.ServerAddress(t.RaftServer.Leader())
-		if leader != "" {
-			if pb.ServerAddress(t.RaftServer.Name()).Equals(leader) {
-				return true
-			}
-		}
+		// Compare against the cached leader instead of RaftServer.Leader(),
+		// which reads the raft server state without a lock (issue #3509).
+		return t.goRaftLeaderIsSelf()
 	} else if t.HashicorpRaft != nil {
 		if t.HashicorpRaft.State() == hashicorpRaft.Leader {
 			return true
@@ -336,7 +335,7 @@ func (t *Topology) MaybeLeader() (l pb.ServerAddress, err error) {
 	defer t.RaftServerAccessLock.RUnlock()
 
 	if t.RaftServer != nil {
-		l = pb.ServerAddress(t.RaftServer.Leader())
+		l = pb.ServerAddress(t.GoRaftLeader())
 	} else if t.HashicorpRaft != nil {
 		l = pb.ServerAddress(t.HashicorpRaft.Leader())
 	} else {

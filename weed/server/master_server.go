@@ -241,13 +241,16 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 	ms.Topo.RaftServerAccessLock.Lock()
 	if raftServer.raftServer != nil {
 		ms.Topo.RaftServer = raftServer.raftServer
+		// The event carries the new leader name, so nothing here has to read
+		// the raft server's unsynchronized leader field (issue #3509).
+		raftServerName := raftServer.raftServer.Name()
 		ms.Topo.RaftServer.AddEventListener(raft.LeaderChangeEventType, func(e raft.Event) {
 			glog.V(0).Infof("leader change event: %+v => %+v", e.PrevValue(), e.Value())
 			stats.MasterLeaderChangeCounter.WithLabelValues(fmt.Sprintf("%+v", e.Value())).Inc()
-			if ms.Topo.RaftServer.Leader() != "" {
-				glog.V(0).Infof("[%s] %s becomes leader.", ms.Topo.RaftServer.Name(), ms.Topo.RaftServer.Leader())
+			if leader, _ := e.Value().(string); leader != "" {
+				glog.V(0).Infof("[%s] %s becomes leader.", raftServerName, leader)
 				ms.Topo.SetLastLeaderChangeTime(time.Now())
-				if pb.ServerAddress(ms.Topo.RaftServer.Leader()).Equals(pb.ServerAddress(ms.Topo.RaftServer.Name())) {
+				if pb.ServerAddress(leader).Equals(pb.ServerAddress(raftServerName)) {
 					go ms.ensureTopologyId()
 				}
 			}
@@ -270,7 +273,7 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 		var raftServerLeader string
 		ms.Topo.RaftServerAccessLock.RLock()
 		if ms.Topo.RaftServer != nil {
-			raftServerLeader = ms.Topo.RaftServer.Leader()
+			raftServerLeader = ms.Topo.GoRaftLeader()
 		} else if ms.Topo.HashicorpRaft != nil {
 			raftServerName = ms.Topo.HashicorpRaft.String()
 			raftServerLeaderAddr, _ := ms.Topo.HashicorpRaft.LeaderWithID()
